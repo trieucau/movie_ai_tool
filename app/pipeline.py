@@ -46,7 +46,10 @@ class PipelineError(Exception):
 def run_pipeline(
     youtube_url: str,
     output_dir: Optional[Path] = None,
-    language: str = "en",
+    language: str = "vi",
+    voice_id: str = "vi-VN-HoaiMyNeural",
+    trim_start: float = 0.0,
+    trim_end: float = 0.0,
     progress_callback: Optional[Callable[[float, str], None]] = None,
     keep_temp: bool = False,
 ) -> Path:
@@ -91,34 +94,29 @@ def run_pipeline(
     temp_dir = config.paths.temp_dir
     ensure_dir(temp_dir)
 
-    # --- URL-based cache invalidation ---
-    # If a different YouTube URL is used, wipe all cached pipeline files so
-    # the pipeline runs fresh from the beginning.
-    session_url_file = temp_dir / "session_url.txt"
-    cached_url = session_url_file.read_text(encoding="utf-8").strip() if session_url_file.exists() else None
-    if cached_url != youtube_url.strip():
-        logger.info("New URL detected — clearing cached pipeline files.")
-        for stale in [
-            "transcript.json", "script.json", "audio.wav",
-            "voice.mp3", "merged.mp4", "with_audio.mp4",
-            "with_subtitles.mp4", "subtitles.ass",
-        ]:
-            stale_path = temp_dir / stale
-            if stale_path.exists():
-                try:
-                    stale_path.unlink()
-                except PermissionError as e:
-                    logger.warning(f"Could not delete {stale_path}: {e}")
-        # Also wipe clip folders
-        import shutil as _shutil
-        for clip_folder in ["clips", "vertical"]:
-            folder = temp_dir / clip_folder
-            if folder.exists():
-                _shutil.rmtree(folder, ignore_errors=True)
-        # Save the new URL as current session
-        session_url_file.write_text(youtube_url.strip(), encoding="utf-8")
-    else:
-        logger.info("Same URL — using cached pipeline files where available.")
+    # --- Always clear old temp data before each run ---
+    # Prevents stale transcripts/translations/TTS from polluting the new run.
+    logger.info("Clearing temp files from previous run...")
+    for stale in [
+        "transcript.json", "script.json", "audio.wav",
+        "voice.mp3", "merged.mp4", "with_audio.mp4",
+        "with_subtitles.mp4", "subtitles.ass", "dubbed_voiceover.mp3",
+    ]:
+        stale_path = temp_dir / stale
+        if stale_path.exists():
+            try:
+                stale_path.unlink()
+                logger.debug(f"Deleted stale temp file: {stale}")
+            except PermissionError as e:
+                logger.warning(f"Could not delete {stale_path}: {e}")
+
+    # Also clear TTS segment folder
+    tts_dir = temp_dir / "dubbing_tts"
+    if tts_dir.exists():
+        import shutil
+        shutil.rmtree(tts_dir, ignore_errors=True)
+        logger.debug("Cleared dubbing_tts folder.")
+
 
     # --- STEP 1: Validate URL ---
     _cb(0.0, "Validating URL...")
@@ -140,6 +138,29 @@ def run_pipeline(
     video_path = video_info.video_path
     movie_title = video_info.title
 
+    # --- STEP 2.5: Trim Video ---
+    if trim_end > trim_start >= 0 and trim_end > 0:
+        _cb(0.15, f"Trimming video from {trim_start}s to {trim_end}s...")
+        trimmed_path = temp_dir / "downloads" / f"trimmed_{int(trim_start)}_{int(trim_end)}_{video_path.name}"
+        if trimmed_path.exists():
+            _cb(0.16, "Using cached trimmed video...")
+            video_path = trimmed_path
+        else:
+            import subprocess
+            from app.utils import find_ffmpeg
+            cmd = [
+                find_ffmpeg(), "-y",
+                "-i", str(video_path),
+                "-ss", str(trim_start),
+                "-to", str(trim_end),
+                "-c", "copy",
+                str(trimmed_path)
+            ]
+            res = subprocess.run(cmd, capture_output=True, text=True)
+            if res.returncode != 0:
+                raise PipelineError(f"Trimming failed: {res.stderr}")
+            video_path = trimmed_path
+
     # --- STEP 3: Transcribe Audio ---
     try:
         # Transcription timing
@@ -155,7 +176,7 @@ def run_pipeline(
             _cb(0.38, "Transcribing audio with Whisper...")
             transcript_segments = transcribe_audio(
                 audio_path,
-                language=language if language != "en" else None,
+                language=None,  # Always auto-detect source language
                 progress_callback=progress_callback,
             )
             save_transcript(transcript_segments, transcript_json_path)
@@ -168,123 +189,51 @@ def run_pipeline(
     transcript_text = transcript_to_text(transcript_segments)
     logger.info(f"Transcript length: {len(transcript_text)} chars")
 
-    # --- STEP 4: Translate transcript to Vietnamese if needed ---
-    if language != "vi":
-        from app.llm.translator import translate_to_vietnamese
-        start_time = time.time()
-        transcript_text = translate_to_vietnamese(transcript_text)
-        logger.info(f"Translation completed in {time.time() - start_time:.2f}s")
-    else:
-        logger.info("Source language is Vietnamese; no translation needed.")
+    # --- STEP 4: Translate ALL segments to Vietnamese (unconditional) ---
+    # Rule: every input video in any language → 100% Vietnamese output.
+    # We do NOT trust Whisper's detected language to decide whether to translate.
+    # The only exception is if the video is already in Vietnamese (detected by translator).
+    _cb(0.50, "Đang dịch sang tiếng Việt (100%)...")
+    start_time = time.time()
+    logger.info(f"[TRANSLATE] Forcing Vietnamese translation for ALL {len(transcript_segments)} segments...")
+    from app.llm.translator import batch_translate_segments
+    translated_segments = batch_translate_segments(
+        transcript_segments,
+        progress_callback=progress_callback,
+    )
+    logger.info(f"[TRANSLATE] Done in {time.time() - start_time:.2f}s")
 
-    # --- STEP 4: Generate AI Script ---
+    # --- STEP 5: Generate Dubbed Audio ---
+    _cb(0.60, "Generating dubbed audio...")
+    from app.voice.dubbing_mixer import generate_dubbed_audio
+    from app.clipper import get_video_duration
+    
+    video_duration = get_video_duration(video_path)
+    voice_path = temp_dir / "dubbed_voiceover.mp3"
+    
     try:
-        # Script generation timing and retry
-        script_json_path = temp_dir / "script.json"
-        max_retries = 3
-        attempt = 0
-        while attempt < max_retries:
-            try:
-                if script_json_path.exists():
-                    _cb(0.56, "Loading cached AI script...")
-                    script = load_script(script_json_path)
-                    logger.info("Loaded script from cache.")
-                    break
-                else:
-                    _cb(0.56, "Generating AI script...")
-                    script = generate_script(
-                        movie_title=movie_title,
-                        transcript_text=transcript_text,
-                        language=language,
-                        progress_callback=progress_callback,
-                    )
-                    save_script(script, script_json_path)
-                    break
-            except RuntimeError as e:
-                if "RateLimitError" in str(e) and attempt < max_retries - 1:
-                    attempt += 1
-                    wait = 2 ** attempt
-                    logger.warning(f"Rate limit hit, retry {attempt}/{max_retries} after {wait}s")
-                    time.sleep(wait)
-                    continue
-                else:
-                    raise PipelineError(f"Script generation failed: {e}") from e
-        logger.info(f"Script generation completed in {time.time() - start_time:.2f}s")
-        start_time = time.time()
-
-    except Exception as e:
-        raise PipelineError(f"Script generation failed: {e}") from e
-
-    # --- STEP 5: Match Clips to Script ---
-    try:
-        _cb(0.63, "Matching scenes to narration...")
-        video_duration = get_video_duration(video_path)
-        
-        # Override clip selections to use the entire video
-        from app.clipper.scene_matcher import ClipSelection
-        clip_selections = [
-            ClipSelection(
-                start=0.0,
-                end=video_duration,
-                score=1.0,
-                segment_index=0,
-                narration_text="Full video",
-            )
-        ]
-        logger.info(f"Keeping full video duration: {video_duration}s")
-
-    except Exception as e:
-        raise PipelineError(f"Scene matching failed: {e}") from e
-
-    # --- STEP 6: Process Clips (cut + vertical) ---
-    try:
-        _cb(0.64, "Cutting and converting clips to vertical...")
-        vertical_clips = process_clips(
-            video_path=video_path,
-            selections=clip_selections,
-            temp_dir=temp_dir,
-            progress_callback=progress_callback,
-        )
-
-        if not vertical_clips:
-            raise PipelineError("No clips were successfully processed.")
-
-        _cb(0.77, "Merging clips...")
-        merged_path = temp_dir / "merged.mp4"
-        add_crossfade_transition(
-            clip_paths=vertical_clips,
-            output_path=merged_path,
-            progress_callback=progress_callback,
-        )
-
-    except Exception as e:
-        raise PipelineError(f"Clip processing failed: {e}") from e
-
-    # --- STEP 7: Generate Voiceover ---
-    try:
-        voice_cache = temp_dir / "voice.mp3"
-        if voice_cache.exists():
-            _cb(0.79, "Using cached voiceover...")
-            logger.info("Loaded voiceover from cache.")
-            voice_path = voice_cache
+        if voice_path.exists():
+            _cb(0.65, "Using cached dubbing...")
         else:
-            _cb(0.79, "Generating AI voiceover...")
-            voice_path = generate_voiceover(
-                text=script.full_narration,
-                output_path=voice_cache,
-                progress_callback=progress_callback,
+            generate_dubbed_audio(
+                segments=translated_segments,
+                video_duration=video_duration,
+                temp_dir=temp_dir,
+                output_path=voice_path,
+                voice_id=voice_id,
+                progress_callback=progress_callback
             )
     except Exception as e:
-        raise PipelineError(f"Voiceover generation failed: {e}") from e
+        raise PipelineError(f"Dubbing generation failed: {e}") from e
 
-    # --- STEP 8: Mix Audio ---
+    # --- STEP 6: Mix Audio (Voice + Music over Original Video) ---
     try:
-        _cb(0.82, "Mixing audio tracks...")
+        _cb(0.75, "Mixing audio tracks...")
         music_path = select_background_music(config.paths.music_dir)
         audio_mixed_path = temp_dir / "with_audio.mp4"
 
         mix_audio_tracks(
-            video_path=merged_path,
+            video_path=video_path,
             voice_path=voice_path,
             music_path=music_path,
             output_path=audio_mixed_path,
@@ -293,18 +242,16 @@ def run_pipeline(
             fade_duration=config.music.fade_duration,
             progress_callback=progress_callback,
         )
-
     except Exception as e:
         raise PipelineError(f"Audio mixing failed: {e}") from e
 
-    # --- STEP 9: Generate Subtitles ---
+    # --- STEP 7: Generate & Burn Subtitles ---
     try:
-        _cb(0.88, "Generating subtitles...")
-        voice_duration = get_audio_duration(voice_path)
-
-        sub_lines = text_to_subtitle_lines(
-            text=script.full_narration,
-            audio_duration=voice_duration or config.max_video_duration,
+        _cb(0.85, "Generating synced subtitles...")
+        from app.subtitle.subtitle_generator import segments_to_subtitle_lines
+        
+        sub_lines = segments_to_subtitle_lines(
+            segments=translated_segments,
             words_per_line=config.subtitle.words_per_line,
         )
 
@@ -352,7 +299,7 @@ def run_pipeline(
     if not keep_temp:
         try:
             # Keep downloads and transcript, clean intermediate files
-            for f in [audio_path, merged_path, audio_mixed_path, subbed_path]:
+            for f in [audio_path, voice_path, audio_mixed_path, subbed_path]:
                 if f.exists():
                     f.unlink()
         except Exception:
@@ -361,24 +308,20 @@ def run_pipeline(
     _cb(1.0, f"✅ Done! Output: {final_path.name}")
     logger.info(f"Pipeline complete. Output: {final_path}")
 
-    # Save metadata
-    _save_metadata(script, movie_title, youtube_url, output_dir, timestamp)
+    # Save basic metadata
+    _save_metadata(movie_title, youtube_url, output_dir, timestamp)
 
     return final_path
 
 
-def _save_metadata(script, title: str, url: str, output_dir: Path, timestamp: str) -> None:
-    """Save script metadata (caption, hashtags) alongside the video."""
+def _save_metadata(title: str, url: str, output_dir: Path, timestamp: str) -> None:
+    """Save basic video metadata."""
     try:
         meta_path = output_dir / f"metadata_{timestamp}.txt"
         with open(meta_path, "w", encoding="utf-8") as f:
-            f.write(f"Title: {script.title}\n")
             f.write(f"Source: {url}\n")
-            f.write(f"Movie: {title}\n\n")
-            f.write(f"Caption:\n{script.caption}\n\n")
-            f.write(f"Hashtags:\n{' '.join(script.hashtags)}\n\n")
-            f.write(f"Hook:\n{script.hook}\n\n")
-            f.write(f"Full Narration:\n{script.full_narration}\n")
+            f.write(f"Title: {title}\n\n")
+            f.write(f"Dubbing processing completed on {datetime.now().isoformat()}\n")
         logger.info(f"Metadata saved: {meta_path}")
     except Exception as e:
         logger.warning(f"Could not save metadata: {e}")

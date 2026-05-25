@@ -60,12 +60,13 @@ class VideoConfig:
     width: int = 1080
     height: int = 1920
     fps: int = 60
-    codec: str = "libx264"
+    use_gpu: bool = field(default_factory=lambda: os.getenv("USE_GPU", "false").lower() == "true")
+    # Dynamically select codec based on USE_GPU
+    codec: str = field(default_factory=lambda: "h264_nvenc" if os.getenv("USE_GPU", "false").lower() == "true" else "libx264")
     crf: int = 18
     preset: str = "fast"
     audio_bitrate: str = "192k"
     video_bitrate: str = "8M"
-    use_gpu: bool = field(default_factory=lambda: os.getenv("USE_GPU", "false").lower() == "true")
 
 
 @dataclass

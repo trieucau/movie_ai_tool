@@ -84,6 +84,54 @@ def text_to_subtitle_lines(
     return lines
 
 
+def segments_to_subtitle_lines(
+    segments: list,
+    words_per_line: int = 4,
+) -> List[SubtitleLine]:
+    """
+    Convert a list of translated TranscriptSegments into SubtitleLine objects.
+    Distributes translated words evenly within each segment's exact timestamps.
+    """
+    lines: List[SubtitleLine] = []
+    
+    for seg in segments:
+        duration = seg.end - seg.start
+        if duration <= 0 or not seg.text.strip():
+            continue
+            
+        words = seg.text.split()
+        if not words:
+            continue
+            
+        time_per_word = duration / len(words)
+        current_pos = seg.start
+        
+        for i in range(0, len(words), words_per_line):
+            chunk = words[i: i + words_per_line]
+            line_duration = len(chunk) * time_per_word
+            line_end = current_pos + line_duration
+            
+            word_objs = []
+            word_start = current_pos
+            for w in chunk:
+                word_end = word_start + time_per_word
+                word_objs.append(SubtitleWord(
+                    start=round(word_start, 3),
+                    end=round(word_end, 3),
+                    word=w,
+                ))
+                word_start = word_end
+                
+            lines.append(SubtitleLine(
+                start=round(current_pos, 3),
+                end=round(line_end, 3),
+                text=" ".join(chunk),
+                words=word_objs,
+            ))
+            current_pos = line_end
+            
+    return lines
+
 def generate_ass_subtitle(
     subtitle_lines: List[SubtitleLine],
     output_path: Path,
@@ -195,7 +243,7 @@ def burn_subtitles(
         find_ffmpeg(), "-y",
         "-i", str(video_path),
         "-vf", f"ass='{sub_path_escaped}'",
-        "-c:v", "libx264",
+        "-c:v", config.video.codec,
         "-c:a", "copy",
         "-preset", "fast",
         "-crf", str(config.video.crf),

@@ -116,7 +116,16 @@ class MovieAIApp(ctk.CTk):
             height=44,
             text_color=TEXT,
         )
-        self._url_entry.grid(row=0, column=1, padx=(0, 20), pady=(20, 4), sticky="ew", columnspan=2)
+        self._url_entry.grid(row=0, column=1, padx=(0, 10), pady=(20, 4), sticky="ew")
+
+        self._load_info_btn = ctk.CTkButton(
+            panel, text="Load Info", width=80, height=34,
+            command=self._load_video_info,
+            fg_color=SURFACE, hover_color="#2A2A4E",
+            border_color=ACCENT, border_width=1, text_color=TEXT,
+            font=ctk.CTkFont(size=13)
+        )
+        self._load_info_btn.grid(row=0, column=2, padx=(0, 20), pady=(20, 4))
 
         # ── Output Folder ──
         ctk.CTkLabel(
@@ -148,27 +157,70 @@ class MovieAIApp(ctk.CTk):
             command=self._browse_output,
         ).grid(row=1, column=2, padx=(8, 20), pady=(4, 4))
 
-        # ── Language selector ──
+        # ── Output language: always Vietnamese (fixed) ──
         ctk.CTkLabel(
-            panel, text="Language",
+            panel, text="Output Language",
             font=ctk.CTkFont(size=13, weight="bold"),
             text_color=SUBTEXT,
-        ).grid(row=2, column=0, padx=(20, 10), pady=(4, 16), sticky="w")
+        ).grid(row=2, column=0, padx=(20, 10), pady=(4, 4), sticky="w")
 
-        self._lang_var = ctk.StringVar(value="English")
-        lang_menu = ctk.CTkOptionMenu(
+        ctk.CTkLabel(
             panel,
-            values=["English", "Vietnamese"],
-            variable=self._lang_var,
+            text="🇻🇳  Tiếng Việt  (bắt buộc)",
+            font=ctk.CTkFont(size=13),
+            text_color="#00C896",
+            anchor="w",
+        ).grid(row=2, column=1, padx=0, pady=(4, 4), sticky="w")
+
+        # language is always vi — no dropdown needed
+        self._lang_var = ctk.StringVar(value="Vietnamese")
+
+        # ── Voice selector ──
+        ctk.CTkLabel(
+            panel, text="Voice",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            text_color=SUBTEXT,
+        ).grid(row=3, column=0, padx=(20, 10), pady=(4, 4), sticky="w")
+
+        self._voice_var = ctk.StringVar(value="Tiếng Việt (Nữ - Hoài My)")
+        voice_menu = ctk.CTkOptionMenu(
+            panel,
+            values=["Tiếng Việt (Nữ - Hoài My)", "Tiếng Việt (Nam - Nam Minh)"],
+            variable=self._voice_var,
             fg_color=SURFACE,
             button_color=ACCENT,
             button_hover_color="#CC3344",
             dropdown_fg_color=SURFACE,
             text_color=TEXT,
             font=ctk.CTkFont(size=13),
-            width=160,
+            width=220,
         )
-        lang_menu.grid(row=2, column=1, padx=0, pady=(4, 16), sticky="w")
+        voice_menu.grid(row=3, column=1, padx=0, pady=(4, 4), sticky="w")
+
+        # ── Trim Video ──
+        ctk.CTkLabel(
+            panel, text="Trim Video",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            text_color=SUBTEXT,
+        ).grid(row=4, column=0, padx=(20, 10), pady=(4, 16), sticky="w")
+
+        trim_frame = ctk.CTkFrame(panel, fg_color="transparent")
+        trim_frame.grid(row=4, column=1, columnspan=2, padx=0, pady=(4, 16), sticky="ew")
+        trim_frame.grid_columnconfigure(0, weight=1)
+
+        self._start_slider = ctk.CTkSlider(trim_frame, from_=0, to=100, command=self._on_start_slider)
+        self._start_slider.set(0)
+        self._start_slider.grid(row=0, column=0, padx=(0,10), pady=0, sticky="ew")
+        self._start_label = ctk.CTkLabel(trim_frame, text="Start: 00:00", font=ctk.CTkFont(size=12), text_color=SUBTEXT, width=80, anchor="w")
+        self._start_label.grid(row=0, column=1, padx=0, pady=0)
+
+        self._end_slider = ctk.CTkSlider(trim_frame, from_=0, to=100, command=self._on_end_slider)
+        self._end_slider.set(100)
+        self._end_slider.grid(row=1, column=0, padx=(0,10), pady=(8,0), sticky="ew")
+        self._end_label = ctk.CTkLabel(trim_frame, text="End: 00:00", font=ctk.CTkFont(size=12), text_color=SUBTEXT, width=80, anchor="w")
+        self._end_label.grid(row=1, column=1, padx=0, pady=(8,0))
+
+        self._video_duration = 0.0
 
         # ── Run Button ──
         self._run_btn = ctk.CTkButton(
@@ -182,7 +234,7 @@ class MovieAIApp(ctk.CTk):
             corner_radius=10,
             command=self._start_pipeline,
         )
-        self._run_btn.grid(row=3, column=0, columnspan=3, padx=20, pady=(0, 20), sticky="ew")
+        self._run_btn.grid(row=5, column=0, columnspan=3, padx=20, pady=(0, 20), sticky="ew")
 
         # ── Progress Bar ──
         self._progress_bar = ctk.CTkProgressBar(
@@ -193,7 +245,7 @@ class MovieAIApp(ctk.CTk):
             height=8,
         )
         self._progress_bar.set(0)
-        self._progress_bar.grid(row=4, column=0, columnspan=3, padx=20, pady=(0, 6), sticky="ew")
+        self._progress_bar.grid(row=6, column=0, columnspan=3, padx=20, pady=(0, 6), sticky="ew")
 
         # ── Status Label ──
         self._status_label = ctk.CTkLabel(
@@ -203,7 +255,7 @@ class MovieAIApp(ctk.CTk):
             text_color=SUBTEXT,
             anchor="w",
         )
-        self._status_label.grid(row=5, column=0, columnspan=3, padx=20, pady=(0, 16), sticky="ew")
+        self._status_label.grid(row=7, column=0, columnspan=3, padx=20, pady=(0, 16), sticky="ew")
 
     def _build_log_panel(self):
         """Log output panel."""
@@ -266,6 +318,66 @@ class MovieAIApp(ctk.CTk):
     # EVENT HANDLERS
     # ─────────────────────────────────────────
 
+    def _format_time(self, seconds: float) -> str:
+        mins = int(seconds // 60)
+        secs = int(seconds % 60)
+        return f"{mins:02d}:{secs:02d}"
+
+    def _load_video_info(self):
+        url = self._url_entry.get().strip()
+        if not url:
+            messagebox.showwarning("Missing URL", "Please enter a YouTube URL.")
+            return
+
+        from app.downloader import is_valid_youtube_url
+        if not is_valid_youtube_url(url):
+            messagebox.showerror("Invalid URL", "The URL doesn't look like a valid YouTube link.")
+            return
+            
+        self._load_info_btn.configure(state="disabled", text="Loading...")
+        
+        def fetch():
+            try:
+                import yt_dlp
+                ydl_opts = {'quiet': True, 'no_warnings': True}
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(url, download=False)
+                    duration = info.get('duration', 0)
+                    
+                self.after(0, self._update_sliders, duration)
+            except Exception as e:
+                self.after(0, lambda: messagebox.showerror("Error", f"Failed to get video info: {e}"))
+            finally:
+                self.after(0, lambda: self._load_info_btn.configure(state="normal", text="Load Info"))
+                
+        threading.Thread(target=fetch, daemon=True).start()
+
+    def _update_sliders(self, duration: float):
+        self._video_duration = duration
+        if duration > 0:
+            self._start_slider.configure(to=duration)
+            self._start_slider.set(0)
+            self._end_slider.configure(to=duration)
+            self._end_slider.set(duration)
+            self._on_start_slider(0)
+            self._on_end_slider(duration)
+            
+    def _on_start_slider(self, value):
+        val = float(value)
+        end_val = float(self._end_slider.get())
+        if val >= end_val:
+            val = end_val - 1.0 if end_val >= 1.0 else 0
+            self._start_slider.set(val)
+        self._start_label.configure(text=f"Start: {self._format_time(val)}")
+
+    def _on_end_slider(self, value):
+        val = float(value)
+        start_val = float(self._start_slider.get())
+        if val <= start_val:
+            val = start_val + 1.0 if start_val + 1.0 <= self._video_duration else self._video_duration
+            self._end_slider.set(val)
+        self._end_label.configure(text=f"End: {self._format_time(val)}")
+
     def _browse_output(self):
         """Open folder selection dialog."""
         folder = filedialog.askdirectory(title="Select Output Folder")
@@ -289,7 +401,16 @@ class MovieAIApp(ctk.CTk):
             messagebox.showerror("Invalid URL", "The URL doesn't look like a valid YouTube link.")
             return
 
-        language = "vi" if self._lang_var.get() == "Vietnamese" else "en"
+        language = "vi"  # Always Vietnamese — non-negotiable
+        
+        voice_selection = self._voice_var.get()
+        if "Nam" in voice_selection:
+            voice_id = "vi-VN-NamMinhNeural"
+        else:
+            voice_id = "vi-VN-HoaiMyNeural"
+            
+        trim_start = float(self._start_slider.get())
+        trim_end = float(self._end_slider.get())
 
         self._running = True
         self._run_btn.configure(state="disabled", text="⏳ Processing...")
@@ -302,12 +423,12 @@ class MovieAIApp(ctk.CTk):
         # Run in background thread to keep UI responsive
         thread = threading.Thread(
             target=self._run_pipeline_thread,
-            args=(url, language),
+            args=(url, language, voice_id, trim_start, trim_end),
             daemon=True,
         )
         thread.start()
 
-    def _run_pipeline_thread(self, url: str, language: str):
+    def _run_pipeline_thread(self, url: str, language: str, voice_id: str, trim_start: float, trim_end: float):
         """Execute the pipeline in a background thread."""
         try:
             from app.pipeline import run_pipeline, PipelineError
@@ -316,6 +437,9 @@ class MovieAIApp(ctk.CTk):
                 youtube_url=url,
                 output_dir=self._output_dir,
                 language=language,
+                voice_id=voice_id,
+                trim_start=trim_start,
+                trim_end=trim_end,
                 progress_callback=self._update_progress,
             )
 
