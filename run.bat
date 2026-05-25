@@ -60,6 +60,18 @@ if not exist ".env" (
     exit /b 1
 )
 
+REM ── Add NVIDIA CUDA DLL dirs to PATH (GPU acceleration) ─────
+set "NVIDIA_BASE=%~dp0venv\Lib\site-packages\nvidia"
+if exist "%NVIDIA_BASE%\cublas\bin"       set "PATH=%NVIDIA_BASE%\cublas\bin;%PATH%"
+if exist "%NVIDIA_BASE%\cuda_runtime\bin" set "PATH=%NVIDIA_BASE%\cuda_runtime\bin;%PATH%"
+if exist "%NVIDIA_BASE%\cuda_nvrtc\bin"   set "PATH=%NVIDIA_BASE%\cuda_nvrtc\bin;%PATH%"
+if exist "%NVIDIA_BASE%\cudnn\bin"        set "PATH=%NVIDIA_BASE%\cudnn\bin;%PATH%"
+if exist "%NVIDIA_BASE%\cufft\bin"        set "PATH=%NVIDIA_BASE%\cufft\bin;%PATH%"
+if exist "%NVIDIA_BASE%\curand\bin"       set "PATH=%NVIDIA_BASE%\curand\bin;%PATH%"
+if exist "%NVIDIA_BASE%\cusolver\bin"     set "PATH=%NVIDIA_BASE%\cusolver\bin;%PATH%"
+if exist "%NVIDIA_BASE%\cusparse\bin"     set "PATH=%NVIDIA_BASE%\cusparse\bin;%PATH%"
+echo [INFO] CUDA DLL dirs registered for GPU support.
+
 REM ── Launch app ───────────────────────────────────────────────
 echo.
 echo [INFO] Launching Movie AI Tool...

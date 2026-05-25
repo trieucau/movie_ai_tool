@@ -68,7 +68,6 @@ def mix_audio_tracks(
             "-c:v", "copy",
             "-c:a", "aac",
             "-b:a", config.video.audio_bitrate,
-            "-shortest",
             str(output_path),
         ]
     else:
@@ -82,7 +81,6 @@ def mix_audio_tracks(
             "-c:v", "copy",
             "-c:a", "aac",
             "-b:a", config.video.audio_bitrate,
-            "-shortest",
             str(output_path),
         ]
 

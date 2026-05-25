@@ -4,6 +4,8 @@ Extracts audio from video and generates timestamped transcript.
 """
 
 import json
+import os
+import sys
 import subprocess
 from pathlib import Path
 from typing import Optional, Callable, List
@@ -13,6 +15,46 @@ from app.utils import get_logger, ensure_dir, find_ffmpeg
 from app.config import config
 
 logger = get_logger(__name__)
+
+# --- Register NVIDIA CUDA DLL directories at import time (Windows only) ---
+# This must happen BEFORE faster_whisper / ctranslate2 is imported so that
+# Windows can locate cublas64_12.dll, cudnn_ops_infer64_8.dll, etc.
+if sys.platform == "win32":
+    _cuda_dirs_registered = []
+    # Collect candidate directories from all known site-packages paths
+    _search_roots = list(sys.path)
+    try:
+        import site as _site
+        _search_roots += _site.getsitepackages()
+        _search_roots += [_site.getusersitepackages()]
+    except Exception:
+        pass
+
+    _nvidia_subdirs = [
+        Path("nvidia") / "cublas" / "bin",
+        Path("nvidia") / "cuda_runtime" / "bin",
+        Path("nvidia") / "cuda_cupti" / "bin",
+        Path("nvidia") / "cudnn" / "bin",
+        Path("nvidia") / "cufft" / "bin",
+        Path("nvidia") / "curand" / "bin",
+        Path("nvidia") / "cusolver" / "bin",
+        Path("nvidia") / "cusparse" / "bin",
+    ]
+
+    for _root in set(_search_roots):
+        for _sub in _nvidia_subdirs:
+            _candidate = Path(_root) / _sub
+            if _candidate.exists() and str(_candidate) not in _cuda_dirs_registered:
+                try:
+                    os.add_dll_directory(str(_candidate))
+                    _cuda_dirs_registered.append(str(_candidate))
+                except Exception:
+                    pass
+
+    if _cuda_dirs_registered:
+        logger.debug(f"Registered {len(_cuda_dirs_registered)} CUDA DLL directories for GPU support")
+    else:
+        logger.debug("No NVIDIA CUDA DLL directories found in site-packages")
 
 
 @dataclass
@@ -94,17 +136,6 @@ def transcribe_audio(
 
     if progress_callback:
         progress_callback(0.35, f"Loading Whisper ({model_size})...")
-
-    try:
-        model = WhisperModel(model_size, device=device, compute_type=compute_type)
-    except Exception as gpu_err:
-        if device != "cpu":
-            logger.warning(f"GPU load failed ({gpu_err}), falling back to CPU...")
-            device = "cpu"
-            compute_type = "int8"
-            model = WhisperModel(model_size, device=device, compute_type=compute_type)
-        else:
-            raise
 
     def _run_transcription(mdl, audio_path, language):
         segments_raw, info = mdl.transcribe(

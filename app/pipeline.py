@@ -219,13 +219,19 @@ def run_pipeline(
     try:
         _cb(0.63, "Matching scenes to narration...")
         video_duration = get_video_duration(video_path)
-        clip_selections = match_clips(
-            script_segments=script.segments,
-            transcript=transcript_segments,
-            video_duration=video_duration,
-            target_duration=config.max_video_duration,
-        )
-        logger.info(f"Matched {len(clip_selections)} clips")
+        
+        # Override clip selections to use the entire video
+        from app.clipper.scene_matcher import ClipSelection
+        clip_selections = [
+            ClipSelection(
+                start=0.0,
+                end=video_duration,
+                score=1.0,
+                segment_index=0,
+                narration_text="Full video",
+            )
+        ]
+        logger.info(f"Keeping full video duration: {video_duration}s")
 
     except Exception as e:
         raise PipelineError(f"Scene matching failed: {e}") from e
