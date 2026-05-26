@@ -16,7 +16,6 @@ from app.transcription import (
     transcribe_audio,
     save_transcript,
     transcript_to_text,
-    load_transcript,
 )
 from app.llm import generate_script, save_script, load_script
 from app.clipper import (
@@ -32,7 +31,7 @@ from app.render import (
     final_render,
     select_background_music,
 )
-from app.utils import get_logger, ensure_dir, clean_temp, safe_filename
+from app.utils import get_logger, ensure_dir, reset_pipeline_workspace, safe_filename
 from app.config import config
 
 logger = get_logger(__name__)
@@ -92,37 +91,15 @@ def run_pipeline(
     output_dir = output_dir or config.paths.output_dir
     ensure_dir(output_dir)
     temp_dir = config.paths.temp_dir
-    ensure_dir(temp_dir)
-
-    # --- Always clear old temp data before each run ---
-    # Prevents stale transcripts/translations/TTS from polluting the new run.
-    logger.info("Clearing temp files from previous run...")
-    # Keep transcript.json + audio.wav for faster re-runs (only clear dub/render outputs)
-    for stale in [
-        "script.json",
-        "voice.mp3", "merged.mp4", "with_audio.mp4",
-        "with_subtitles.mp4", "subtitles.ass", "dubbed_voiceover.mp3",
-    ]:
-        stale_path = temp_dir / stale
-        if stale_path.exists():
-            try:
-                stale_path.unlink()
-                logger.debug(f"Deleted stale temp file: {stale}")
-            except PermissionError as e:
-                logger.warning(f"Could not delete {stale_path}: {e}")
-
-    # Also clear TTS segment folder
-    tts_dir = temp_dir / "dubbing_tts"
-    if tts_dir.exists():
-        import shutil
-        shutil.rmtree(tts_dir, ignore_errors=True)
-        logger.debug("Cleared dubbing_tts folder.")
-
 
     # --- STEP 1: Validate URL ---
     _cb(0.0, "Validating URL...")
     if not is_valid_youtube_url(youtube_url):
         raise ValueError(f"Invalid YouTube URL: {youtube_url}")
+
+    # Full wipe: every run starts fresh (no transcript/TTS/download from previous URL).
+    _cb(0.01, "Xóa dữ liệu tạm video trước...")
+    reset_pipeline_workspace(temp_dir, youtube_url, trim_start, trim_end)
 
     # --- STEP 2: Download Video ---
     try:
@@ -143,24 +120,20 @@ def run_pipeline(
     if trim_end > trim_start >= 0 and trim_end > 0:
         _cb(0.15, f"Trimming video from {trim_start}s to {trim_end}s...")
         trimmed_path = temp_dir / "downloads" / f"trimmed_{int(trim_start)}_{int(trim_end)}_{video_path.name}"
-        if trimmed_path.exists():
-            _cb(0.16, "Using cached trimmed video...")
-            video_path = trimmed_path
-        else:
-            import subprocess
-            from app.utils import find_ffmpeg
-            cmd = [
-                find_ffmpeg(), "-y",
-                "-i", str(video_path),
-                "-ss", str(trim_start),
-                "-to", str(trim_end),
-                "-c", "copy",
-                str(trimmed_path)
-            ]
-            res = subprocess.run(cmd, capture_output=True, text=True)
-            if res.returncode != 0:
-                raise PipelineError(f"Trimming failed: {res.stderr}")
-            video_path = trimmed_path
+        import subprocess
+        from app.utils import find_ffmpeg
+        cmd = [
+            find_ffmpeg(), "-y",
+            "-i", str(video_path),
+            "-ss", str(trim_start),
+            "-to", str(trim_end),
+            "-c", "copy",
+            str(trimmed_path),
+        ]
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        if res.returncode != 0:
+            raise PipelineError(f"Trimming failed: {res.stderr}")
+        video_path = trimmed_path
 
     audio_path: Optional[Path] = temp_dir / "audio.wav"
     step_times: dict[str, float] = {}
@@ -169,21 +142,16 @@ def run_pipeline(
     try:
         t_step = time.time()
         transcript_json_path = temp_dir / "transcript.json"
-        if transcript_json_path.exists():
-            _cb(0.38, "Loading cached transcript...")
-            transcript_segments = load_transcript(transcript_json_path)
-            logger.info("Loaded transcript from cache.")
-        else:
-            _cb(0.33, "Extracting audio...")
-            audio_path = extract_audio(video_path, temp_dir / "audio.wav")
+        _cb(0.33, "Extracting audio...")
+        audio_path = extract_audio(video_path, temp_dir / "audio.wav")
 
-            _cb(0.38, "Transcribing audio with Whisper...")
-            transcript_segments = transcribe_audio(
-                audio_path,
-                language=None,  # Always auto-detect source language
-                progress_callback=progress_callback,
-            )
-            save_transcript(transcript_segments, transcript_json_path)
+        _cb(0.38, "Transcribing audio with Whisper...")
+        transcript_segments = transcribe_audio(
+            audio_path,
+            language=None,
+            progress_callback=progress_callback,
+        )
+        save_transcript(transcript_segments, transcript_json_path)
         step_times["transcribe"] = time.time() - t_step
         logger.info(f"Transcription completed in {step_times['transcribe']:.1f}s")
 
@@ -231,17 +199,14 @@ def run_pipeline(
     voice_path = temp_dir / "dubbed_voiceover.mp3"
 
     try:
-        if voice_path.exists():
-            _cb(0.65, "Using cached dubbing...")
-        else:
-            generate_dubbed_audio(
-                segments=translated_segments,
-                video_duration=video_duration,
-                temp_dir=temp_dir,
-                output_path=voice_path,
-                voice_id=voice_id,
-                progress_callback=progress_callback
-            )
+        generate_dubbed_audio(
+            segments=translated_segments,
+            video_duration=video_duration,
+            temp_dir=temp_dir,
+            output_path=voice_path,
+            voice_id=voice_id,
+            progress_callback=progress_callback,
+        )
     except Exception as e:
         raise PipelineError(f"Dubbing generation failed: {e}") from e
     step_times["dubbing"] = time.time() - t_step

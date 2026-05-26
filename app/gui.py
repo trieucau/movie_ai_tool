@@ -418,6 +418,7 @@ class MovieAIApp(ctk.CTk):
         self._status_label.configure(text="Starting pipeline...", text_color=ACCENT2)
         self._log("═" * 60)
         self._log(f"🎬 Starting pipeline for:\n   {url}", color="accent")
+        self._log("🧹 Mỗi lần chạy sẽ xóa sạch temp/ (không dùng lại video cũ).")
         self._log("═" * 60)
 
         # Run in background thread to keep UI responsive

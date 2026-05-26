@@ -2,7 +2,9 @@
 File and path utility helpers.
 """
 
+import json
 import os
+import re
 import shutil
 import hashlib
 from pathlib import Path
@@ -21,9 +23,65 @@ def ensure_dir(path: Path) -> Path:
 def clean_temp(temp_dir: Path) -> None:
     """Remove all files in temp directory."""
     if temp_dir.exists():
-        shutil.rmtree(temp_dir)
+        shutil.rmtree(temp_dir, ignore_errors=True)
     temp_dir.mkdir(parents=True, exist_ok=True)
     logger.info(f"Cleaned temp directory: {temp_dir}")
+
+
+def extract_youtube_video_id(url: str) -> Optional[str]:
+    """Extract canonical YouTube video id from URL (11 chars)."""
+    url = (url or "").strip()
+    patterns = [
+        r"(?:youtube\.com/watch\?v=|youtube\.com/shorts/)([\w-]{11})",
+        r"youtu\.be/([\w-]{11})",
+        r"youtube\.com/embed/([\w-]{11})",
+    ]
+    for pat in patterns:
+        m = re.search(pat, url, re.IGNORECASE)
+        if m:
+            return m.group(1)
+    return None
+
+
+def reset_pipeline_workspace(
+    temp_dir: Path,
+    youtube_url: str,
+    trim_start: float = 0.0,
+    trim_end: float = 0.0,
+) -> None:
+    """
+    Wipe all intermediate pipeline data so a new URL never reuses a previous run.
+    Called at the start of every pipeline execution.
+    """
+    state_path = temp_dir / "run_state.json"
+    video_id = extract_youtube_video_id(youtube_url)
+
+    if state_path.exists():
+        try:
+            prev = json.loads(state_path.read_text(encoding="utf-8"))
+            prev_id = prev.get("video_id")
+            if prev_id and video_id and prev_id != video_id:
+                logger.info(
+                    f"New video detected ({prev_id} -> {video_id}), clearing all temp data."
+                )
+        except Exception:
+            pass
+
+    clean_temp(temp_dir)
+    state_path.write_text(
+        json.dumps(
+            {
+                "youtube_url": youtube_url.strip(),
+                "video_id": video_id,
+                "trim_start": trim_start,
+                "trim_end": trim_end,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    logger.info(f"Pipeline workspace reset for video_id={video_id}")
 
 
 def url_to_id(url: str) -> str:
