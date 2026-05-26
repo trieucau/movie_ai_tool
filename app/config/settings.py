@@ -59,7 +59,7 @@ class PathConfig:
 class VideoConfig:
     width: int = 1080
     height: int = 1920
-    fps: int = 60
+    fps: int = int(os.getenv("OUTPUT_FPS", "30"))
     use_gpu: bool = field(default_factory=lambda: os.getenv("USE_GPU", "false").lower() == "true")
     # Dynamically select codec based on USE_GPU
     codec: str = field(default_factory=lambda: "h264_nvenc" if os.getenv("USE_GPU", "false").lower() == "true" else "libx264")
@@ -80,8 +80,8 @@ class WhisperConfig:
 @dataclass
 class TTSConfig:
     engine: str = field(default_factory=lambda: os.getenv("TTS_ENGINE", "edge"))  # edge | elevenlabs
-    edge_voice: str = field(default_factory=lambda: os.getenv("EDGE_VOICE", "en-US-GuyNeural"))
-    rate: str = "+10%"
+    edge_voice: str = field(default_factory=lambda: os.getenv("EDGE_VOICE", "vi-VN-HoaiMyNeural"))
+    rate: str = field(default_factory=lambda: os.getenv("EDGE_TTS_RATE", "+0%"))
     volume: str = "+0%"
 
 

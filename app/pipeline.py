@@ -97,8 +97,9 @@ def run_pipeline(
     # --- Always clear old temp data before each run ---
     # Prevents stale transcripts/translations/TTS from polluting the new run.
     logger.info("Clearing temp files from previous run...")
+    # Keep transcript.json + audio.wav for faster re-runs (only clear dub/render outputs)
     for stale in [
-        "transcript.json", "script.json", "audio.wav",
+        "script.json",
         "voice.mp3", "merged.mp4", "with_audio.mp4",
         "with_subtitles.mp4", "subtitles.ass", "dubbed_voiceover.mp3",
     ]:
@@ -161,9 +162,12 @@ def run_pipeline(
                 raise PipelineError(f"Trimming failed: {res.stderr}")
             video_path = trimmed_path
 
+    audio_path: Optional[Path] = temp_dir / "audio.wav"
+    step_times: dict[str, float] = {}
+
     # --- STEP 3: Transcribe Audio ---
     try:
-        # Transcription timing
+        t_step = time.time()
         transcript_json_path = temp_dir / "transcript.json"
         if transcript_json_path.exists():
             _cb(0.38, "Loading cached transcript...")
@@ -180,8 +184,8 @@ def run_pipeline(
                 progress_callback=progress_callback,
             )
             save_transcript(transcript_segments, transcript_json_path)
-        logger.info(f"Transcription completed in {time.time() - start_time:.2f}s")
-        start_time = time.time()
+        step_times["transcribe"] = time.time() - t_step
+        logger.info(f"Transcription completed in {step_times['transcribe']:.1f}s")
 
     except Exception as e:
         raise PipelineError(f"Transcription failed: {e}") from e
@@ -189,28 +193,43 @@ def run_pipeline(
     transcript_text = transcript_to_text(transcript_segments)
     logger.info(f"Transcript length: {len(transcript_text)} chars")
 
+    from app.transcription.segment_consolidator import consolidate_segments
+
+    raw_count = len(transcript_segments)
+    transcript_segments = consolidate_segments(transcript_segments)
+    logger.info(
+        f"Consolidated transcript: {raw_count} → {len(transcript_segments)} segments "
+        "(fewer API calls for translate + dubbing)"
+    )
+    save_transcript(transcript_segments, transcript_json_path)
+
     # --- STEP 4: Translate ALL segments to Vietnamese (unconditional) ---
     # Rule: every input video in any language → 100% Vietnamese output.
     # We do NOT trust Whisper's detected language to decide whether to translate.
     # The only exception is if the video is already in Vietnamese (detected by translator).
     _cb(0.50, "Đang dịch sang tiếng Việt (100%)...")
-    start_time = time.time()
+    t_step = time.time()
     logger.info(f"[TRANSLATE] Forcing Vietnamese translation for ALL {len(transcript_segments)} segments...")
-    from app.llm.translator import batch_translate_segments
-    translated_segments = batch_translate_segments(
-        transcript_segments,
-        progress_callback=progress_callback,
-    )
-    logger.info(f"[TRANSLATE] Done in {time.time() - start_time:.2f}s")
+    from app.llm.translator import batch_translate_segments, TranslationError
+    try:
+        translated_segments = batch_translate_segments(
+            transcript_segments,
+            progress_callback=progress_callback,
+        )
+    except TranslationError as e:
+        raise PipelineError(str(e)) from e
+    step_times["translate"] = time.time() - t_step
+    logger.info(f"[TRANSLATE] Done in {step_times['translate']:.1f}s")
 
     # --- STEP 5: Generate Dubbed Audio ---
     _cb(0.60, "Generating dubbed audio...")
     from app.voice.dubbing_mixer import generate_dubbed_audio
     from app.clipper import get_video_duration
-    
+
+    t_step = time.time()
     video_duration = get_video_duration(video_path)
     voice_path = temp_dir / "dubbed_voiceover.mp3"
-    
+
     try:
         if voice_path.exists():
             _cb(0.65, "Using cached dubbing...")
@@ -225,9 +244,12 @@ def run_pipeline(
             )
     except Exception as e:
         raise PipelineError(f"Dubbing generation failed: {e}") from e
+    step_times["dubbing"] = time.time() - t_step
+    logger.info(f"Dubbing completed in {step_times['dubbing']:.1f}s (voice={voice_id})")
 
     # --- STEP 6: Mix Audio (Voice + Music over Original Video) ---
     try:
+        t_step = time.time()
         _cb(0.75, "Mixing audio tracks...")
         music_path = select_background_music(config.paths.music_dir)
         audio_mixed_path = temp_dir / "with_audio.mp4"
@@ -242,11 +264,14 @@ def run_pipeline(
             fade_duration=config.music.fade_duration,
             progress_callback=progress_callback,
         )
+        step_times["mix_audio"] = time.time() - t_step
+        logger.info(f"Audio mix completed in {step_times['mix_audio']:.1f}s")
     except Exception as e:
         raise PipelineError(f"Audio mixing failed: {e}") from e
 
     # --- STEP 7: Generate & Burn Subtitles ---
     try:
+        t_step = time.time()
         _cb(0.85, "Generating synced subtitles...")
         from app.subtitle.subtitle_generator import segments_to_subtitle_lines
         
@@ -270,12 +295,15 @@ def run_pipeline(
             progress_callback=progress_callback,
         )
 
+        step_times["subtitles"] = time.time() - t_step
+        logger.info(f"Subtitles completed in {step_times['subtitles']:.1f}s")
     except Exception as e:
         logger.warning(f"Subtitle generation failed: {e}. Skipping subtitles.")
         subbed_path = audio_mixed_path
 
     # --- STEP 10: Final Render ---
     try:
+        t_step = time.time()
         _cb(0.93, "Final render...")
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         clean_title = safe_filename(movie_title)[:40]
@@ -292,21 +320,27 @@ def run_pipeline(
             progress_callback=progress_callback,
         )
 
+        step_times["final_render"] = time.time() - t_step
+        logger.info(f"Final render completed in {step_times['final_render']:.1f}s")
     except Exception as e:
         raise PipelineError(f"Final render failed: {e}") from e
 
     # Cleanup temp files
     if not keep_temp:
         try:
-            # Keep downloads and transcript, clean intermediate files
-            for f in [audio_path, voice_path, audio_mixed_path, subbed_path]:
-                if f.exists():
+            for f in [voice_path, audio_mixed_path, subbed_path]:
+                if f and Path(f).exists():
                     f.unlink()
+            if audio_path and audio_path.exists():
+                audio_path.unlink()
         except Exception:
             pass
 
     _cb(1.0, f"✅ Done! Output: {final_path.name}")
     logger.info(f"Pipeline complete. Output: {final_path}")
+    if step_times:
+        breakdown = ", ".join(f"{k}={v:.1f}s" for k, v in step_times.items())
+        logger.info(f"Step timings: {breakdown}")
 
     # Save basic metadata
     _save_metadata(movie_title, youtube_url, output_dir, timestamp)

@@ -14,6 +14,10 @@ from dataclasses import dataclass, asdict
 from app.utils import get_logger, ensure_dir, find_ffmpeg
 from app.config import config
 
+# Reuse one local model per process (avoid reload every run)
+_local_whisper_model = None
+_local_whisper_key: Optional[tuple] = None
+
 logger = get_logger(__name__)
 
 # --- Register NVIDIA CUDA DLL directories at import time (Windows only) ---
@@ -105,6 +109,69 @@ def extract_audio(
     return output_path
 
 
+def _transcribe_with_groq_api(
+    audio_path: Path,
+    language: Optional[str],
+    progress_callback: Optional[Callable[[float, str], None]] = None,
+) -> List[TranscriptSegment]:
+    """Cloud Whisper via Groq — typically much faster than local CPU."""
+    from groq import Groq
+
+    if progress_callback:
+        progress_callback(0.38, "Transcribing via Groq API...")
+
+    client = Groq(api_key=config.api.groq_api_key)
+    model = config.api.groq_whisper_model
+
+    with open(audio_path, "rb") as audio_file:
+        kwargs = {
+            "file": audio_file,
+            "model": model,
+            "response_format": "verbose_json",
+            "timestamp_granularities": ["segment"],
+        }
+        if language:
+            kwargs["language"] = language
+        result = client.audio.transcriptions.create(**kwargs)
+
+    segs: List[TranscriptSegment] = []
+    raw_segments = getattr(result, "segments", None) or []
+    for seg in raw_segments:
+        if isinstance(seg, dict):
+            text = (seg.get("text") or "").strip()
+            start = seg.get("start", 0)
+            end = seg.get("end", 0)
+        else:
+            text = (getattr(seg, "text", None) or "").strip()
+            start = getattr(seg, "start", 0)
+            end = getattr(seg, "end", 0)
+        if not text:
+            continue
+        segs.append(TranscriptSegment(
+            start=round(float(start), 3),
+            end=round(float(end), 3),
+            text=text,
+            words=None,
+        ))
+
+    if not segs and getattr(result, "text", None):
+        segs.append(TranscriptSegment(start=0.0, end=0.0, text=result.text.strip()))
+
+    logger.info(f"Groq transcribed {len(segs)} segments")
+    return segs
+
+
+def _get_local_whisper_model(model_size: str, device: str, compute_type: str):
+    global _local_whisper_model, _local_whisper_key
+    key = (model_size, device, compute_type)
+    if _local_whisper_model is not None and _local_whisper_key == key:
+        return _local_whisper_model
+    from faster_whisper import WhisperModel
+    _local_whisper_model = WhisperModel(model_size, device=device, compute_type=compute_type)
+    _local_whisper_key = key
+    return _local_whisper_model
+
+
 def transcribe_audio(
     audio_path: Path,
     language: Optional[str] = None,
@@ -121,16 +188,35 @@ def transcribe_audio(
     Returns:
         List of TranscriptSegment with timestamps.
     """
+    cfg = config.whisper
+    engine = os.getenv("TRANSCRIBE_ENGINE", "auto").lower()
+
+    # Skip broken CUDA attempt when user forces CPU
+    prefer_cpu = os.getenv("WHISPER_DEVICE", "").lower() == "cpu"
+
+    if config.api.groq_api_key and engine in ("auto", "groq"):
+        try:
+            segs = _transcribe_with_groq_api(audio_path, language, progress_callback)
+            if progress_callback:
+                progress_callback(0.55, f"Transcription complete ({len(segs)} segments)")
+            return segs
+        except Exception as e:
+            logger.warning(f"Groq transcription failed ({e}), using local Whisper...")
+
     try:
-        from faster_whisper import WhisperModel
+        from faster_whisper import WhisperModel  # noqa: F401
     except ImportError:
         raise ImportError("faster-whisper is not installed. Run: pip install faster-whisper")
 
-    cfg = config.whisper
-    model_size = language.lower() == "vi" and "medium" or cfg.model_size if language else cfg.model_size
+    model_size = cfg.model_size
+    if language and language.lower() == "vi":
+        model_size = os.getenv("WHISPER_MODEL_VI", "small")
 
-    device = cfg.device
-    compute_type = cfg.compute_type
+    device = "cpu" if prefer_cpu else cfg.device
+    compute_type = "int8" if device == "cpu" else cfg.compute_type
+    if device == "cpu" and cfg.model_size in ("medium", "large", "large-v3"):
+        model_size = os.getenv("WHISPER_CPU_MODEL", "base")
+    use_words = os.getenv("WHISPER_WORD_TIMESTAMPS", "false").lower() == "true"
 
     logger.info(f"Loading Whisper model: {model_size} on {device}")
 
@@ -141,9 +227,10 @@ def transcribe_audio(
         segments_raw, info = mdl.transcribe(
             str(audio_path),
             language=language,
-            word_timestamps=True,
+            word_timestamps=use_words,
             vad_filter=True,
             vad_parameters={"min_silence_duration_ms": 500},
+            condition_on_previous_text=False,
         )
         segs: List[TranscriptSegment] = []
         for seg in segments_raw:
@@ -160,7 +247,7 @@ def transcribe_audio(
         return segs, info
 
     try:
-        model = WhisperModel(model_size, device=device, compute_type=compute_type)
+        model = _get_local_whisper_model(model_size, device, compute_type)
         logger.info(f"Transcribing: {audio_path}")
         if progress_callback:
             progress_callback(0.40, "Transcribing audio...")
@@ -168,12 +255,13 @@ def transcribe_audio(
     except Exception as gpu_err:
         if device != "cpu":
             logger.warning(f"GPU transcription failed ({gpu_err}), retrying on CPU...")
+            fallback_size = os.getenv("WHISPER_CPU_FALLBACK_MODEL", "base")
             device = "cpu"
             compute_type = "int8"
-            model = WhisperModel(model_size, device=device, compute_type=compute_type)
-            logger.info(f"Transcribing on CPU: {audio_path}")
+            model = _get_local_whisper_model(fallback_size, device, compute_type)
+            logger.info(f"Transcribing on CPU ({fallback_size}): {audio_path}")
             if progress_callback:
-                progress_callback(0.40, "Transcribing audio (CPU fallback)...")
+                progress_callback(0.40, f"Transcribing ({fallback_size} CPU)...")
             segments, info = _run_transcription(model, audio_path, language)
         else:
             raise

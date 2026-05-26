@@ -4,6 +4,7 @@ Composites video clips, voiceover, background music, and subtitles
 into the final TikTok-ready vertical video.
 """
 
+import os
 import subprocess
 import random
 from pathlib import Path
@@ -118,28 +119,37 @@ def final_render(
     """
     ensure_dir(output_path.parent)
 
-    logger.info(f"Final render: {width}x{height}@{target_fps}fps")
+    skip_reencode = os.getenv("FINAL_RENDER_FAST", "true").lower() == "true"
+    logger.info(f"Final render: {width}x{height}@{target_fps}fps (fast_copy={skip_reencode})")
 
     if progress_callback:
         progress_callback(0.93, "Final render...")
 
-    if use_gpu:
-        video_codec = ["h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", "20"]
+    if skip_reencode:
+        cmd = [
+            find_ffmpeg(), "-y",
+            "-i", str(video_path),
+            "-c", "copy",
+            "-movflags", "+faststart",
+            str(output_path),
+        ]
     else:
-        video_codec = ["libx264", "-preset", config.video.preset, "-crf", str(config.video.crf)]
-
-    cmd = [
-        find_ffmpeg(), "-y",
-        "-i", str(video_path),
-        "-r", str(target_fps),
-        "-c:v", *video_codec,
-        "-c:a", "aac",
-        "-b:a", config.video.audio_bitrate,
-        "-b:v", config.video.video_bitrate,
-        "-movflags", "+faststart",
-        "-pix_fmt", "yuv420p",
-        str(output_path),
-    ]
+        if use_gpu:
+            video_codec = ["h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", "20"]
+        else:
+            video_codec = ["libx264", "-preset", config.video.preset, "-crf", str(config.video.crf)]
+        cmd = [
+            find_ffmpeg(), "-y",
+            "-i", str(video_path),
+            "-r", str(target_fps),
+            "-c:v", *video_codec,
+            "-c:a", "aac",
+            "-b:a", config.video.audio_bitrate,
+            "-b:v", config.video.video_bitrate,
+            "-movflags", "+faststart",
+            "-pix_fmt", "yuv420p",
+            str(output_path),
+        ]
 
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
